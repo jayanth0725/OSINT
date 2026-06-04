@@ -1,0 +1,13 @@
+streamlit>=1.32.0
+exifread
+pymupdf
+pyzbar
+opencv-python-headless
+Pillow
+requests
+python-whois
+tweepy
+sherlock-project
+fpdf2
+plotly
+ffmpeg-python
