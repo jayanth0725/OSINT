@@ -1,2 +1,8 @@
 .env
 .streamlit/secrets.toml
+t.py
+threat_detection.log
+
+# Python cache & large model weights
+__pycache__/
+*.pt

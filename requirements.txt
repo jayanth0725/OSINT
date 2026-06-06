@@ -1,4 +1,5 @@
 streamlit>=1.32.0
+numpy<2                   # torch + ultralytics require NumPy 1.x
 exifread
 pymupdf
 pyzbar
@@ -11,3 +12,8 @@ sherlock-project
 fpdf2
 plotly
 ffmpeg-python
+# Threat Detection dependencies
+ultralytics
+torch
+google-genai
+python-dotenv

@@ -1,0 +1,794 @@
+import streamlit as st
+import cv2
+import numpy as np
+import base64
+import logging
+import json
+import requests
+from typing import List, Dict, Tuple, Optional
+from datetime import datetime
+from PIL import Image
+import io
+import os
+from ultralytics import YOLO
+from google import genai
+from google.genai import types as genai_types
+from dotenv import load_dotenv
+
+load_dotenv()  # keep for local .env fallback
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+try:
+    logging.getLogger().addHandler(logging.FileHandler('threat_detection.log'))
+except (PermissionError, OSError):
+    pass  # Read-only filesystem (e.g. Streamlit Cloud)
+logger = logging.getLogger(__name__)
+
+class ConfigManager:
+    def __init__(self):
+        # Priority: st.secrets → os.getenv → user sidebar input
+        self.gemini_api_key = (
+            st.secrets.get("GEMINI_API_KEY", "")  # Streamlit secrets (preferred)
+            or os.getenv("GEMINI_API_KEY", "")      # .env / environment variable
+        ) or ""
+        self.model_path = 'yolo26n.pt'
+        
+    def get_api_key_from_user(self) -> str:
+        """Get API key from user input in sidebar if not available in environment"""
+        if 'gemini_api_key' not in st.session_state:
+            st.session_state.gemini_api_key = self.gemini_api_key or ""
+        
+        with st.sidebar:
+            st.header("🔑 API Configuration")
+            
+            if not self.gemini_api_key:
+                st.warning("⚠️ Gemini API key not found in environment")
+                
+                api_key_input = st.text_input(
+                    "Enter your Gemini API Key:",
+                    type="password",
+                    value=st.session_state.gemini_api_key,
+                    placeholder="Your Google Gemini API Key",
+                    help="Get your API key from https://makersuite.google.com/app/apikey",
+                    key="gemini_api_key_input"
+                )
+                
+                if api_key_input and api_key_input != st.session_state.gemini_api_key:
+                    st.session_state.gemini_api_key = api_key_input
+                    # Invalidate cached validation so it re-runs with the new key
+                    st.session_state.pop('config_validated', None)
+                    st.session_state.pop('config_api_key', None)
+                    st.success("✅ API Key updated!")
+                    # Compatible rerun across Streamlit versions
+                    if hasattr(st, 'rerun'):
+                        st.rerun()
+                    else:
+                        st.experimental_rerun()
+                
+                return st.session_state.gemini_api_key
+            else:
+                st.success("✅ API Key loaded from secrets/environment")
+                return self.gemini_api_key
+        
+    def validate_config(self) -> tuple[bool, str]:
+        """Validate configuration and return (is_valid, api_key)"""
+        # Only cache successful validation; failed results must re-render the text_input
+        if st.session_state.get('config_validated') is True and st.session_state.get('config_api_key'):
+            return True, st.session_state.config_api_key
+
+        api_key = self.get_api_key_from_user()
+        
+        if not api_key:
+            with st.sidebar:
+                st.error("❌ Please provide a valid Gemini API Key")
+            return False, ""
+        
+        # Basic format check only; real API validation happens in ThreatAnalyzer init
+        if len(api_key.strip()) < 10:
+            with st.sidebar:
+                st.error("❌ API Key appears too short")
+            return False, ""
+
+        with st.sidebar:
+            st.success("✅ API Key accepted")
+        st.session_state.config_validated = True
+        st.session_state.config_api_key = api_key
+        return True, api_key
+
+@st.cache_resource
+def load_yolo_model(model_path: str):
+    """Cache YOLO model so it persists across Streamlit reruns."""
+    try:
+        logger.info(f"Loading YOLO model from {model_path}...")
+        model = YOLO(model_path)
+        dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
+        _ = model(dummy_image, verbose=False)
+        logger.info(f"YOLO model loaded and tested successfully from {model_path}")
+        return model
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {str(e)}")
+        alternative_models = ['yolo26s.pt', 'yolo26m.pt', 'yolo26l.pt', 'yolo26x.pt']
+        for alt_model in alternative_models:
+            try:
+                logger.info(f"Trying alternative model: {alt_model}")
+                model = YOLO(alt_model)
+                dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
+                _ = model(dummy_image, verbose=False)
+                logger.info(f"Successfully loaded alternative model: {alt_model}")
+                return model
+            except Exception as alt_e:
+                logger.warning(f"Alternative model {alt_model} also failed: {str(alt_e)}")
+                continue
+        raise Exception(f"All YOLO models failed to load. Original error: {str(e)}")
+
+class ObjectDetector:
+    def __init__(self, model_path: str):
+        self.model = load_yolo_model(model_path)
+        if self.model is None:
+            raise Exception("YOLO model initialization failed completely")
+    
+    def detect_objects(self, image: np.ndarray, confidence_threshold: float = 0.5) -> List[Dict]:
+        try:
+            if image is None or image.size == 0:
+                logger.error("Input image is None or empty")
+                return []
+            if len(image.shape) == 3 and image.shape[2] == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            elif len(image.shape) == 3 and image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+            logger.info(f"Running YOLO inference on image of shape: {image.shape}")
+            results = self.model(image, conf=confidence_threshold, verbose=False)
+            detected_objects = []
+            if results is not None and len(results) > 0:
+                for result in results:
+                    if hasattr(result, 'boxes') and result.boxes is not None:
+                        boxes = result.boxes
+                        for i in range(len(boxes)):
+                            try:
+                                confidence = float(boxes.conf[i]) if boxes.conf is not None else 0.0
+                                class_id = int(boxes.cls[i]) if boxes.cls is not None else 0
+                                if class_id < len(self.model.names):
+                                    class_name = self.model.names[class_id]
+                                else:
+                                    class_name = f"unknown_{class_id}"
+                                if boxes.xyxy is not None:
+                                    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+                                else:
+                                    x1, y1, x2, y2 = [0, 0, 0, 0]
+                                detected_objects.append({
+                                    'class_name': class_name,
+                                    'confidence': confidence,
+                                    'bbox': [x1, y1, x2, y2],
+                                    'class_id': class_id
+                                })
+                            except Exception as box_error:
+                                logger.warning(f"Error processing box {i}: {str(box_error)}")
+                                continue
+            logger.info(f"Successfully detected {len(detected_objects)} objects")
+            return detected_objects
+        except Exception as e:
+            logger.error(f"Object detection failed: {str(e)}")
+            return []
+
+# Ordered list of Gemini models to try – free-tier models first.
+_GEMINI_MODELS = [
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-8b',
+    'gemini-1.5-pro',
+    'gemini-2.5-flash-preview-05-20',
+    'gemini-2.5-pro-preview-05-06',
+    'gemini-3-flash-preview',
+]
+
+class ThreatAnalyzer:
+    """Gemini-backed threat analyser.  Model probing is deferred to the first
+    real request so that quota is not wasted during initialisation and a 429
+    does not prevent the YOLO detector from working."""
+
+    def __init__(self, api_key: str):
+        try:
+            self.client = genai.Client(api_key=api_key)
+            # model_name is resolved lazily on first call to analyze_threat
+            self.model_name: Optional[str] = None
+            logger.info("Gemini client created – model will be probed on first request")
+        except Exception as e:
+            logger.error(f"Failed to create Gemini client: {str(e)}")
+            raise
+
+    def _resolve_model(self) -> bool:
+        """Try each model in order until one responds successfully.  Returns
+        True if a working model was found, False otherwise."""
+        if self.model_name is not None:
+            return True
+        for model_name in _GEMINI_MODELS:
+            try:
+                test_resp = self.client.models.generate_content(
+                    model=model_name,
+                    contents='Hi'
+                )
+                if test_resp and test_resp.text:
+                    self.model_name = model_name
+                    logger.info(f"Gemini model resolved: {model_name}")
+                    return True
+            except Exception as err:
+                logger.warning(f"Model {model_name} unavailable: {err}")
+                continue
+        logger.error("All Gemini models are unavailable (quota exhausted or invalid key)")
+        return False
+    
+    def analyze_threat(self, detected_objects: List[Dict], context: str = "", image_data: Optional[bytes] = None) -> Dict:
+        try:
+            object_list = [obj['class_name'] for obj in detected_objects] if detected_objects else []
+            object_counts = {}
+            for obj in object_list:
+                object_counts[obj] = object_counts.get(obj, 0) + 1
+            logger.info(f"Analyzing threat for objects: {object_counts}")
+            if detected_objects:
+                prompt = f"""
+                You are an expert security analyst with computer vision capabilities. Analyze this scene for potential threats.
+                
+                YOLO DETECTED OBJECTS:
+                {json.dumps(object_counts, indent=2)}
+                
+                CONTEXT: {context}
+                
+                Perform comprehensive analysis:
+                1. Review the YOLO-detected objects for weapons or dangerous items
+                2. Look for unusual object combinations that might indicate suspicious activity
+                3. If an image is provided, analyze it visually for any threats YOLO might have missed
+                4. Consider context-appropriate threat assessment
+                5. Look for people, weapons, suspicious behavior, or dangerous situations
+                
+                Respond ONLY in valid JSON format:
+                {{
+                    "threat_level": "LOW",
+                    "is_suspicious": false,
+                    "explanation": "Your detailed analysis combining YOLO results and visual inspection",
+                    "recommended_action": "Action to take based on complete analysis",
+                    "confidence": 0.85,
+                    "additional_objects_found": ["any additional objects you visually identified"]
+                }}
+                
+                Use only LOW/MEDIUM/HIGH for threat_level. Be thorough but conservative.
+                """
+            else:
+                prompt = f"""
+                You are an expert security analyst with computer vision capabilities. YOLO object detection found no objects in this image, but you need to perform visual analysis to ensure nothing was missed.
+                
+                YOLO RESULT: No objects detected
+                CONTEXT: {context}
+                
+                Perform comprehensive visual analysis:
+                1. Carefully examine the entire image for any people, objects, or activities
+                2. Look for weapons, dangerous items, or suspicious behavior
+                3. Identify any security threats that automated detection might have missed
+                4. Consider lighting, image quality, or other factors that might affect detection
+                5. Assess overall scene safety and security implications
+                
+                Respond ONLY in valid JSON format:
+                {{
+                    "threat_level": "LOW",
+                    "is_suspicious": false,
+                    "explanation": "Your detailed visual analysis of what you can see in the image",
+                    "recommended_action": "Action to take based on visual inspection",
+                    "confidence": 0.85,
+                    "objects_identified": ["list any objects or people you can identify"]
+                }}
+                
+                Use only LOW/MEDIUM/HIGH for threat_level. Be thorough - this is the only analysis being performed.
+                """
+            # Resolve a working model before making real requests
+            if not self._resolve_model():
+                logger.error("Skipping LLM analysis – no Gemini model available")
+                if detected_objects:
+                    explanation = (f"YOLO detected {len(object_counts)} object type(s): "
+                                   f"{', '.join(object_counts.keys())}. "
+                                   "Gemini AI analysis unavailable (quota exhausted). "
+                                   "Review YOLO results manually.")
+                else:
+                    explanation = ("YOLO detected no objects. "
+                                   "Gemini AI analysis unavailable (quota exhausted). "
+                                   "Manual review recommended.")
+                return {
+                    "threat_level": "LOW" if detected_objects else "MEDIUM",
+                    "is_suspicious": False,
+                    "explanation": explanation,
+                    "recommended_action": "Gemini quota exhausted – review YOLO results manually.",
+                    "confidence": 0.4,
+                    "yolo_only": True,
+                }
+
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    logger.info(f"LLM analysis attempt {attempt + 1} {'with image' if image_data else 'text-only'}")
+                    if image_data:
+                        content = [
+                            genai_types.Part.from_bytes(data=image_data, mime_type="image/jpeg"),
+                            prompt,
+                        ]
+                    else:
+                        content = prompt
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=content,
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.3,
+                            top_p=0.8,
+                            top_k=40,
+                            max_output_tokens=1000,
+                        )
+                    )
+                    if not response or not response.text:
+                        logger.warning(f"Empty response from LLM on attempt {attempt + 1}")
+                        continue
+                    analysis_text = response.text.strip()
+                    logger.info(f"Raw LLM response: {analysis_text[:200]}...")
+                    if '```json' in analysis_text:
+                        start = analysis_text.find('```json') + 7
+                        end = analysis_text.find('```', start)
+                        analysis_text = analysis_text[start:end]
+                    elif '```' in analysis_text:
+                        start = analysis_text.find('```') + 3
+                        end = analysis_text.find('```', start)
+                        analysis_text = analysis_text[start:end]
+                    analysis_text = analysis_text.strip()
+                    analysis = json.loads(analysis_text)
+                    required_fields = ['threat_level', 'is_suspicious', 'explanation', 'recommended_action', 'confidence']
+                    if not all(field in analysis for field in required_fields):
+                        logger.warning(f"Missing fields in LLM response: {analysis}")
+                        continue
+                    if analysis['threat_level'] not in ['LOW', 'MEDIUM', 'HIGH']:
+                        analysis['threat_level'] = 'LOW'
+                    if not isinstance(analysis['confidence'], (int, float)) or not 0 <= analysis['confidence'] <= 1:
+                        analysis['confidence'] = 0.5
+                    logger.info(f"Threat analysis completed: {analysis['threat_level']} threat level")
+                    return analysis
+                except json.JSONDecodeError as json_error:
+                    logger.warning(f"JSON parsing failed on attempt {attempt + 1}: {str(json_error)}")
+                    logger.warning(f"Raw text: {analysis_text}")
+                    continue
+                except Exception as attempt_error:
+                    logger.warning(f"Analysis attempt {attempt + 1} failed: {str(attempt_error)}")
+                    continue
+            logger.error("All LLM analysis attempts failed")
+            if detected_objects:
+                explanation = f"Analysis of {len(object_counts)} object types completed, but LLM response parsing failed. Objects detected: {', '.join(object_counts.keys())}. Manual review recommended."
+            else:
+                explanation = "No objects detected by YOLO and LLM visual analysis failed. Manual review strongly recommended to ensure scene safety."
+            return {
+                "threat_level": "LOW" if detected_objects else "MEDIUM",
+                "is_suspicious": False,
+                "explanation": explanation,
+                "recommended_action": "Manual review of the scene is recommended due to technical issues.",
+                "confidence": 0.3
+            }
+        except Exception as e:
+            logger.error(f"Threat analysis failed completely: {str(e)}")
+            return {
+                "threat_level": "UNKNOWN",
+                "is_suspicious": False,
+                "explanation": f"Threat analysis failed due to technical error: {str(e)}",
+                "recommended_action": "Technical review required.",
+                "confidence": 0.0
+            }
+
+class AlertAgent:
+    def __init__(self):
+        self.alert_log = []
+    
+    def send_authority_alert(self, analysis: Dict, detected_objects: List[Dict]) -> bool:
+        try:
+            alert_message = {
+                "timestamp": datetime.now().isoformat(),
+                "threat_level": analysis["threat_level"],
+                "location": "Camera Feed",
+                "detected_objects": [obj['class_name'] for obj in detected_objects],
+                "analysis": analysis["explanation"],
+                "recommended_action": analysis["recommended_action"]
+            }
+            logger.warning(f"SECURITY ALERT: {json.dumps(alert_message, indent=2)}")
+            self.alert_log.append(alert_message)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send authority alert: {str(e)}")
+            return False
+    
+    def generate_user_message(self, analysis: Dict, detected_objects: List[Dict], alert_sent: bool = False, had_yolo_detection: bool = True) -> str:
+        try:
+            api_key = (
+                st.session_state.get('config_api_key', '')
+                or st.secrets.get('GEMINI_API_KEY', '')
+                or os.getenv('GEMINI_API_KEY', '')
+            )
+            if not api_key:
+                return "System message: Analysis completed. Please check the detailed results above."
+            client = genai.Client(api_key=api_key)
+            model_name = 'gemini-3-flash-preview'
+            detection_method = "YOLO object detection and AI vision analysis" if had_yolo_detection else "comprehensive AI vision analysis (YOLO detected no objects)"
+            prompt = f"""
+            Generate a clear, professional message for a user of a security monitoring system.
+            
+            ANALYSIS RESULTS:
+            - Detection Method Used: {detection_method}
+            - Threat Level: {analysis['threat_level']}
+            - Suspicious Activity: {analysis['is_suspicious']}
+            - Analysis: {analysis['explanation']}
+            - Confidence: {analysis['confidence']}
+            - Alert Sent to Authorities: {alert_sent}
+            
+            DETECTED OBJECTS: {[obj['class_name'] for obj in detected_objects] if detected_objects else "None by YOLO"}
+            
+            Create a concise, professional message that:
+            1. Explains the detection method used (dual-layer vs vision-only analysis)
+            2. Summarizes the analysis results in simple terms
+            3. Indicates what action was taken (if any)
+            4. Provides appropriate reassurance or caution based on the threat level
+            5. Mentions the thoroughness of the analysis system
+            
+            Keep it under 150 words and maintain a professional but friendly tone.
+            """
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate user message: {str(e)}")
+            detection_info = "dual-layer analysis" if had_yolo_detection else "AI vision analysis"
+            return f"Analysis completed using {detection_info} with {analysis['threat_level']} threat level. " + \
+                   ("Authorities have been notified." if alert_sent else "No immediate action required.")
+
+class ThreatDetectionApp:
+    def __init__(self):
+        self.config = ConfigManager()
+        self.agent = AlertAgent()
+        self.initialization_error = None
+
+    @property
+    def detector(self):
+        return st.session_state.get('_detector')
+
+    @detector.setter
+    def detector(self, value):
+        st.session_state['_detector'] = value
+
+    @property
+    def analyzer(self):
+        return st.session_state.get('_analyzer')
+
+    @analyzer.setter
+    def analyzer(self, value):
+        st.session_state['_analyzer'] = value
+        
+    def initialize_components(self):
+        """Initialize YOLO and (optionally) Gemini.
+
+        YOLO is required; Gemini is best-effort.  A Gemini quota / key error
+        logs a warning but still returns True so the uploader is shown and
+        YOLO-only analysis can proceed.
+        """
+        is_valid, api_key = self.config.validate_config()
+        if not is_valid:
+            self.initialization_error = "Configuration validation failed"
+            return False
+
+        # ── YOLO (required) ──────────────────────────────────────────────────
+        if self.detector is None:
+            try:
+                logger.info("Initializing YOLO detector...")
+                self.detector = ObjectDetector(self.config.model_path)
+                logger.info("YOLO detector initialized successfully")
+            except Exception as e:
+                self.initialization_error = f"YOLO model failed to load: {str(e)}"
+                logger.error(self.initialization_error)
+                st.session_state.pop('config_validated', None)
+                st.session_state.pop('config_api_key', None)
+                return False
+
+        # ── Gemini (optional – degrades gracefully to YOLO-only) ─────────────
+        if self.analyzer is None:
+            try:
+                logger.info("Initializing Gemini analyzer...")
+                self.analyzer = ThreatAnalyzer(api_key)
+                logger.info("Gemini client created (model probe deferred)")
+            except Exception as e:
+                # Non-fatal: YOLO will still run; Gemini analysis will be skipped
+                logger.warning(f"Gemini client creation failed: {str(e)} – running YOLO-only")
+                st.session_state['gemini_unavailable'] = str(e)
+
+        self.initialization_error = None
+        return True
+    
+    def process_image(self, uploaded_file) -> Tuple[List[Dict], Dict, str]:
+        try:
+            if self.detector is None:
+                raise Exception("Object detector not initialized. Check YOLO model loading.")
+            # analyzer may be None if Gemini client creation failed – that's OK
+            st.info("📷 Loading and preprocessing image...")
+            image = Image.open(uploaded_file)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            image_np = np.array(image)
+            logger.info(f"Image loaded: {image_np.shape}, dtype: {image_np.dtype}")
+            if image_np is None or image_np.size == 0:
+                raise Exception("Invalid image data")
+            image_bytes = None
+            try:
+                uploaded_file.seek(0)
+                image_bytes = uploaded_file.read()
+                if not uploaded_file.name.lower().endswith(('.jpg', '.jpeg')):
+                    buffer = io.BytesIO()
+                    image.save(buffer, format='JPEG', quality=85)
+                    image_bytes = buffer.getvalue()
+                    buffer.close()
+                logger.info(f"Image prepared for LLM analysis: {len(image_bytes)} bytes")
+                uploaded_file.seek(0)
+            except Exception as img_prep_error:
+                logger.warning(f"Failed to prepare image for LLM: {str(img_prep_error)}")
+                image_bytes = None
+            st.info("🔍 Detecting objects in the image...")
+            detected_objects = self.detector.detect_objects(image_np)
+            if detected_objects:
+                object_names = [obj['class_name'] for obj in detected_objects]
+                logger.info(f"Objects detected by YOLO: {object_names}")
+                st.success(f"✅ YOLO detected {len(detected_objects)} objects")
+            else:
+                logger.info("No objects detected by YOLO")
+                if self.analyzer is not None:
+                    st.warning("⚠️ YOLO detected no objects - performing AI vision analysis...")
+                else:
+                    st.warning("⚠️ YOLO detected no objects (AI vision unavailable)")
+
+            # ── Gemini analysis (best-effort) ─────────────────────────────────
+            if self.analyzer is not None:
+                st.info("🧠 Analyzing potential threats with AI vision...")
+                analysis = self.analyzer.analyze_threat(
+                    detected_objects,
+                    context="Security monitoring system",
+                    image_data=image_bytes,
+                )
+            else:
+                # YOLO-only fallback
+                obj_names = [o['class_name'] for o in detected_objects]
+                analysis = {
+                    "threat_level": "LOW" if detected_objects else "MEDIUM",
+                    "is_suspicious": False,
+                    "explanation": (
+                        f"YOLO detected: {', '.join(obj_names)}." if obj_names
+                        else "YOLO detected no objects."
+                    ) + " Gemini AI analysis is unavailable (quota exhausted or invalid key).",
+                    "recommended_action": "Review YOLO detections manually. Recharge Gemini quota for AI analysis.",
+                    "confidence": 0.4,
+                    "yolo_only": True,
+                }
+            if not analysis or 'threat_level' not in analysis:
+                logger.error("Invalid analysis result from LLM")
+                analysis = {
+                    "threat_level": "MEDIUM",
+                    "is_suspicious": False,
+                    "explanation": "Analysis failed to produce valid results. Manual review strongly recommended.",
+                    "recommended_action": "Manual review recommended.",
+                    "confidence": 0.3
+                }
+            if not detected_objects:
+                additional_info = ""
+                if 'objects_identified' in analysis:
+                    additional_info = f" LLM identified: {analysis['objects_identified']}"
+                elif 'additional_objects_found' in analysis:
+                    additional_info = f" LLM found: {analysis['additional_objects_found']}"
+                logger.info(f"No YOLO detections, LLM analysis: {analysis['threat_level']} threat.{additional_info}")
+                no_objects_message = f"""
+                YOLO object detection found no objects in this image, but our AI vision system has performed 
+                a comprehensive visual analysis. 
+                
+                **Analysis Result**: {analysis['threat_level']} threat level
+                **AI Assessment**: {analysis['explanation']}
+                
+                This dual-layer approach ensures thorough security monitoring even when automated 
+                object detection doesn't identify specific items.
+                """
+                return [], analysis, no_objects_message.strip()
+            alert_sent = False
+            if analysis.get("is_suspicious", False) and analysis.get("threat_level", "LOW") in ["MEDIUM", "HIGH"]:
+                st.warning("⚠️ Suspicious activity detected. Notifying authorities...")
+                alert_sent = self.agent.send_authority_alert(analysis, detected_objects)
+            st.info("💬 Generating summary message...")
+            user_message = self.agent.generate_user_message(analysis, detected_objects, alert_sent, had_yolo_detection=bool(detected_objects))
+            logger.info("Image processing completed successfully")
+            return detected_objects, analysis, user_message
+        except Exception as e:
+            logger.error(f"Image processing failed: {str(e)}")
+            st.error(f"Processing Error: {str(e)}")
+            error_analysis = {
+                "threat_level": "ERROR",
+                "is_suspicious": False,
+                "explanation": f"Processing failed: {str(e)}",
+                "recommended_action": "Please try again with a different image or check system configuration.",
+                "confidence": 0.0
+            }
+            return [], error_analysis, f"Sorry, there was an error processing your image: {str(e)}"
+    
+    def run(self):
+        st.set_page_config(
+            page_title="AI Threat Detection System",
+            page_icon="🛡️",
+            layout="wide"
+        )
+        
+        st.title("🛡️ AI-Powered Threat Detection System")
+        st.markdown("Upload an image to analyze for potential security threats using **dual-layer AI detection**: YOLO object detection + Gemini Vision analysis for comprehensive threat assessment.")
+        
+        with st.expander("🔍 How it works"):
+            st.markdown("""
+            **Dual-Layer Detection Process:**
+            
+            1. **YOLO Object Detection**: Identifies specific objects, people, and items with confidence scores
+            2. **AI Vision Analysis**: Google Gemini examines the entire image for threats that might be missed
+            3. **Combined Assessment**: Both analyses are merged for comprehensive threat evaluation
+            4. **Smart Fallback**: When YOLO finds nothing, AI Vision performs complete visual inspection
+            
+            This ensures maximum detection accuracy and minimizes false negatives.
+            """)
+        
+        with st.sidebar:
+            st.header("ℹ️ About")
+            st.markdown("""
+            This system uses:
+            - **YOLO26** for object detection
+            - **Google Gemini Vision** for AI image analysis
+            - **Dual-layer detection** for comprehensive coverage
+            - **Automated alerts** for suspicious activities
+            
+            **Detection Methods:**
+            1. **YOLO** identifies specific objects with confidence scores
+            2. **AI Vision** performs visual analysis when YOLO detection is insufficient
+            3. **Combined Analysis** ensures nothing is missed
+            
+            **Supported formats:** JPG, JPEG, PNG
+            """)
+        
+        # Initialize components (this handles API key configuration in sidebar)
+        components_ready = self.initialize_components()
+        is_valid = st.session_state.get('config_validated', False)
+        gemini_unavailable = st.session_state.get('gemini_unavailable', '')
+
+        with st.sidebar:
+            st.header("🔧 System Status")
+
+            if is_valid and components_ready:
+                yolo_ok = self.detector is not None
+                gemini_ok = self.analyzer is not None and not gemini_unavailable
+
+                if yolo_ok and gemini_ok:
+                    st.success("✅ System Ready (Dual-Layer)")
+                    st.info(f"🤖 YOLO Model: {self.config.model_path}")
+                    st.info("🧠 LLM: Google Gemini Vision")
+                    st.info("🔍 Dual-Layer Detection: Active")
+                elif yolo_ok:
+                    st.warning("⚠️ YOLO-Only Mode")
+                    st.info(f"🤖 YOLO Model: {self.config.model_path}")
+                    st.error("🧠 Gemini AI: Unavailable (quota exhausted)")
+                    st.info("📌 Object detection still works; AI vision is disabled")
+            elif is_valid and not components_ready:
+                st.error(f"❌ System Error: {self.initialization_error}")
+                st.info("Please check your API key and try again.")
+            else:
+                st.error("❌ Configuration Error")
+                st.info("Please provide a valid Gemini API key to continue.")
+        
+        # Show file uploader whenever YOLO is ready (even if Gemini is not)
+        if components_ready and self.detector is not None:
+            if gemini_unavailable:
+                st.warning(
+                    "⚠️ **Gemini quota exhausted** – running in **YOLO-only mode**. "
+                    "Object detection still works. [Recharge credits](https://ai.studio/projects) to re-enable AI vision."
+                )
+            uploaded_file = st.file_uploader(
+                "Choose an image file",
+                type=['jpg', 'jpeg', 'png'],
+                help="Upload an image to analyze for potential threats"
+            )
+            
+            if uploaded_file is not None:
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    st.subheader("📷 Uploaded Image")
+                    image = Image.open(uploaded_file)
+                    st.image(image, caption="Uploaded Image", use_column_width=True)
+                with col2:
+                    st.subheader("🔄 Processing Status")
+                    with st.spinner("Processing image..."):
+                        detected_objects, analysis, user_message = self.process_image(uploaded_file)
+                    st.success("✅ Analysis Complete!")
+                
+                st.markdown("---")
+                st.header("📊 Analysis Results")
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    st.subheader("🎯 Object Detection Results")
+                    if detected_objects:
+                        st.write("**YOLO Detected Objects:**")
+                        for obj in detected_objects:
+                            confidence_pct = obj['confidence'] * 100
+                            st.write(f"• **{obj['class_name']}** ({confidence_pct:.1f}%)")
+                    else:
+                        st.write("**YOLO Detection:** No objects found")
+                    
+                    if 'objects_identified' in analysis and analysis['objects_identified']:
+                        st.write("**AI Vision Identified:**")
+                        for obj in analysis['objects_identified']:
+                            st.write(f"• **{obj}** (Vision AI)")
+                    elif 'additional_objects_found' in analysis and analysis['additional_objects_found']:
+                        st.write("**Additional Objects Found by AI:**")
+                        for obj in analysis['additional_objects_found']:
+                            st.write(f"• **{obj}** (Vision AI)")
+                    
+                    if not detected_objects and not analysis.get('objects_identified') and not analysis.get('additional_objects_found'):
+                        st.info("🔍 Both YOLO and AI Vision performed comprehensive analysis")
+                
+                with col2:
+                    st.subheader("🧠 AI Analysis")
+                    threat_level = analysis.get('threat_level', 'UNKNOWN')
+                    if threat_level == 'HIGH':
+                        st.error(f"🚨 **Threat Level:** {threat_level}")
+                    elif threat_level == 'MEDIUM':
+                        st.warning(f"⚠️ **Threat Level:** {threat_level}")
+                    else:
+                        st.success(f"✅ **Threat Level:** {threat_level}")
+                    
+                    is_suspicious = analysis.get('is_suspicious', False)
+                    if is_suspicious:
+                        st.error("🔍 **Suspicious Activity:** Yes")
+                    else:
+                        st.success("🔍 **Suspicious Activity:** No")
+                    
+                    confidence = analysis.get('confidence', 0.0)
+                    st.metric("📈 Confidence", f"{confidence:.1%}")
+                
+                with col3:
+                    st.subheader("💬 AI Reasoning")
+                    explanation = analysis.get('explanation', 'No explanation available')
+                    st.write(explanation)
+                    recommended_action = analysis.get('recommended_action', 'None')
+                    st.write(f"**Recommended Action:** {recommended_action}")
+                
+                st.markdown("---")
+                st.header("📋 Summary")
+                st.info(user_message)
+                
+                if hasattr(self.agent, 'alert_log') and self.agent.alert_log:
+                    with st.expander("🚨 Alert Log"):
+                        for alert in self.agent.alert_log:
+                            st.json(alert)
+        else:
+            # Show helpful message when system is not ready
+            st.info("🔧 **System Configuration Required**")
+            st.markdown("""
+            To use the threat detection system, please:
+            1. Enter your Google Gemini API key in the sidebar
+            2. Wait for system validation
+            3. Upload an image for analysis
+            
+            Get your API key from: [Google AI Studio](https://makersuite.google.com/app/apikey)
+            """)
+
+def main():
+    try:
+        app = ThreatDetectionApp()
+        app.run()
+    except Exception as e:
+        st.error(f"Application failed to start: {str(e)}")
+        logger.error(f"Application startup failed: {str(e)}")
+
+if __name__ == "__main__":
+    main()
