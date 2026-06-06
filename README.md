@@ -1,9 +1,9 @@
-# OSINT Investigator Platform
+# Cyber Trident Platform
 
 ![Screenshot Placeholder](docs/screenshot-placeholder.png)
 
 ## Overview
-OSINT Investigator Platform is a production-ready, multi-page Streamlit application that unifies metadata extraction, QR fraud detection, and social media intelligence into a single investigative dashboard. It is designed for cybersecurity analysts and OSINT practitioners who need fast, repeatable workflows and structured reporting.
+Cyber Trident Platform is a production-ready, multi-page Streamlit application that unifies metadata extraction, QR fraud detection, and social media intelligence into a single investigative dashboard. It is designed for cybersecurity analysts and OSINT practitioners who need fast, repeatable workflows and structured reporting.
 
 ## Prerequisites
 - Python 3.10+

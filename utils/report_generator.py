@@ -32,7 +32,7 @@ def generate_pdf_report(case_log: List[Dict[str, Any]], filename: str) -> bytes:
 
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 12, "OSINT Investigator - Case Report", ln=True)
+    pdf.cell(0, 12, "Cyber Trident - Case Report", ln=True)
     pdf.set_font("Helvetica", "", 12)
     pdf.cell(0, 10, f"Generated: {datetime.now(timezone.utc).isoformat()} UTC", ln=True)
     pdf.cell(0, 10, f"Total findings: {len(case_log)}", ln=True)

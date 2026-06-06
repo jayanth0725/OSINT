@@ -1,1 +1,1 @@
-"""Utility helpers for OSINT Investigator."""
+"""Utility helpers for Cyber Trident."""

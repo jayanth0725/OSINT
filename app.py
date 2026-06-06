@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 import streamlit as st
 
 
-st.set_page_config(page_title="OSINT Investigator", layout="wide", page_icon="🔍")
+st.set_page_config(page_title="Cyber Trident", layout="wide", page_icon="🔍")
 
 
 @st.cache_data
@@ -54,7 +54,7 @@ st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 _init_case_log()
 case_log: List[Dict[str, Any]] = st.session_state["case_log"]
 
-st.title("OSINT Investigator Platform")
+st.title("Cyber Trident Platform")
 st.write("Unified cybersecurity investigation toolkit for metadata, QR, and social intelligence.")
 
 col1, col2, col3 = st.columns(3)

@@ -1,1 +1,1 @@
-"""OSINT Investigator modules."""
+"""Cyber Trident modules."""

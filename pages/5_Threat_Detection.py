@@ -1,4 +1,4 @@
-"""Page wrapper that embeds Threat.py inside the multi-page OSINT app."""
+"""Page wrapper that embeds Threat.py inside the multi-page Cyber Trident app."""
 from __future__ import annotations
 
 import sys

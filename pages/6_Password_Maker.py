@@ -1,6 +1,6 @@
 """
 6_Password_Maker.py — Customisable Password Generator
-Integrated into the OSINT Investigator Platform multi-page app.
+Integrated into the Cyber Trident Platform multi-page app.
 """
 from __future__ import annotations
 
