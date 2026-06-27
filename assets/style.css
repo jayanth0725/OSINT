@@ -1,28 +1,4 @@
-/* OSINT Investigator dark theme */
-
-:root {
-    --bg-main: #0e1117;
-    --bg-sidebar: #0a0c11;
-    --bg-card: #141922;
-    --border-accent: #243042;
-    --text-main: #f2f4f8;
-    --text-muted: #9aa4b2;
-    --accent: #1f6feb;
-    --success: #1f8b4c;
-    --warning: #c69026;
-    --error: #d43f3a;
-    --code-bg: #0b0f14;
-    --code-border: #1c2433;
-}
-
-section.main {
-    background-color: var(--bg-main);
-    color: var(--text-main);
-}
-
-section[data-testid="stSidebar"] {
-    background-color: var(--bg-sidebar);
-}
+/* OSINT Investigator custom component styling (Theme colors handled via .streamlit/config.toml) */
 
 div[data-testid="metric-container"] {
     background-color: var(--bg-card);
